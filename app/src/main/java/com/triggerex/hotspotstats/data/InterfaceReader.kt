@@ -13,6 +13,9 @@ class InterfaceReader(private val shell: ShellRunner) {
     private val previousCounters = mutableMapOf<String, TrafficCounters>()
     private val macCache = mutableMapOf<String, String?>()
 
+    /** Last root-read counters and rates per interface; root reads are throttled. */
+    private val rootReads = mutableMapOf<String, Triple<TrafficCounters, Double?, Double?>>()
+
     suspend fun read(
         tethered: Set<String>,
         upstreamInterfaces: Set<String>,
@@ -46,8 +49,8 @@ class InterfaceReader(private val shell: ShellRunner) {
             val isTethered = name in tethered
             val kind = classify(name, isTethered, isUpstream, apEnabled, addresses)
             val wantsCounters = kind != InterfaceKind.LOOPBACK
-            val counters = if (wantsCounters) readCounters(name, privileged = isTethered || kind == InterfaceKind.WIFI_HOTSPOT) else null
-            val (rxRate, txRate) = rates(name, counters)
+            val privileged = isTethered || kind == InterfaceKind.WIFI_HOTSPOT
+            val (counters, rxRate, txRate) = if (wantsCounters) countersAndRates(name, privileged) else Triple(null, null, null)
 
             InterfaceInfo(
                 name = name,
@@ -121,7 +124,7 @@ class InterfaceReader(private val shell: ShellRunner) {
         return mac
     }
 
-    private suspend fun readCounters(name: String, privileged: Boolean): TrafficCounters? {
+    private suspend fun countersAndRates(name: String, privileged: Boolean): Triple<TrafficCounters?, Double?, Double?> {
         val dir = "/sys/class/net/$name/statistics"
         val values = COUNTER_FILES.map { f ->
             try {
@@ -130,15 +133,26 @@ class InterfaceReader(private val shell: ShellRunner) {
                 null
             }
         }
-        val resolved = if (values.all { it != null }) {
-            values.map { it!! }
-        } else if (privileged && shell.rootGranted) {
-            val out = shell.run("cd $dir && cat ${COUNTER_FILES.joinToString(" ")}", root = true)
-            out?.stdout?.lines()?.mapNotNull { it.trim().toLongOrNull() }?.takeIf { it.size == COUNTER_FILES.size }
-        } else {
-            null
-        } ?: return null
+        if (values.all { it != null }) {
+            val counters = toCounters(values.map { it!! })
+            val (rx, tx) = rates(name, counters)
+            return Triple(counters, rx, tx)
+        }
+        if (!privileged || !shell.rootGranted) return Triple(null, null, null)
 
+        // Each su call costs a process (and a toast / log entry on Magisk), so reuse the
+        // last root read for a few seconds instead of spawning su on every refresh.
+        val cached = rootReads[name]
+        if (cached != null && System.currentTimeMillis() - cached.first.timestampMs < ROOT_READ_INTERVAL_MS) return cached
+        val out = shell.run("cd $dir && cat ${COUNTER_FILES.joinToString(" ")}", root = true)
+        val parsed = out?.stdout?.lines()?.mapNotNull { it.trim().toLongOrNull() }?.takeIf { it.size == COUNTER_FILES.size }
+            ?: return cached ?: Triple(null, null, null)
+        val counters = toCounters(parsed)
+        val (rx, tx) = rates(name, counters)
+        return Triple(counters, rx, tx).also { rootReads[name] = it }
+    }
+
+    private fun toCounters(resolved: List<Long>): TrafficCounters {
         return TrafficCounters(
             rxBytes = resolved[0], txBytes = resolved[1],
             rxPackets = resolved[2], txPackets = resolved[3],
@@ -159,6 +173,7 @@ class InterfaceReader(private val shell: ShellRunner) {
     }
 
     private companion object {
+        const val ROOT_READ_INTERVAL_MS = 6_000L
         val COUNTER_FILES = listOf(
             "rx_bytes", "tx_bytes", "rx_packets", "tx_packets",
             "rx_errors", "tx_errors", "rx_dropped", "tx_dropped",

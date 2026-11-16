@@ -141,4 +141,28 @@ class ClientMergerTest {
         )
         assertEquals(listOf("192.168.43.9", "192.168.43.20", "192.168.43.100"), clients.map { it.ip })
     }
+
+    @Test
+    fun `reused ip with a different mac does not inherit identity`() {
+        val first = ClientMerger.merge(
+            inputs(
+                probes = listOf(ClientScanner.ProbeResult("192.168.43.10", 3.0, listOf(445))),
+                neighbours = listOf(neighbour("192.168.43.10", "aa:bb:cc:dd:ee:01")),
+                names = mapOf("192.168.43.10" to ("DESKTOP-ABC" to "NetBIOS")),
+            ),
+        )
+        val second = ClientMerger.merge(
+            inputs(
+                previous = first,
+                probes = listOf(ClientScanner.ProbeResult("192.168.43.10", 5.0, listOf(62078))),
+                neighbours = listOf(neighbour("192.168.43.10", "aa:bb:cc:dd:ee:02")),
+                nowMs = now + 10_000,
+            ),
+        )
+        val c = second.single()
+        assertEquals("aa:bb:cc:dd:ee:02", c.mac)
+        assertNull(c.hostname)
+        assertEquals(now + 10_000, c.firstSeenMs)
+        assertEquals(listOf(62078), c.openPorts)
+    }
 }

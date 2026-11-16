@@ -43,7 +43,8 @@ object ClientMerger {
             val probe = probeByIp[ip]
             val neighbour = neighbourByIp[ip]
             val knownMac = neighbour?.mac ?: leaseByIp[ip]?.mac
-            val previous = input.previous[ip]
+            // An IP handed to a different device (different MAC) must not inherit the old identity.
+            val previous = input.previous[ip]?.takeUnless { knownMac != null && it.mac != null && it.mac != knownMac }
                 ?: knownMac?.let { m -> input.previous.values.firstOrNull { it.mac == m } }
             val mac = knownMac ?: previous?.mac
             val station = mac?.let(stationsByMac::get)
@@ -93,7 +94,8 @@ object ClientMerger {
             resolved != null -> resolved
             else -> previous?.hostname to previous?.hostnameSource
         }
-        val openPorts = (probe?.openPorts.orEmpty() + previous?.openPorts.orEmpty()).distinct().sorted()
+        // Fresh probe results replace older ones; quick passes carry no port data, so keep the last set.
+        val openPorts = probe?.openPorts?.takeIf { it.isNotEmpty() } ?: previous?.openPorts.orEmpty()
         return ConnectedClient(
             ip = ip,
             mac = mac,

@@ -9,11 +9,17 @@ import com.triggerex.hotspotstats.data.HotspotRepository
 import com.triggerex.hotspotstats.data.HotspotSnapshot
 import com.triggerex.hotspotstats.data.LocalHotspotController
 import com.triggerex.hotspotstats.data.ScanProgress
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -105,51 +111,78 @@ class HotspotViewModel(app: Application) : AndroidViewModel(app) {
     fun startLocalHotspot() = repo.localHotspot.start()
     fun stopLocalHotspot() = repo.localHotspot.stop()
 
+    override fun onCleared() {
+        // A local-only hotspot reservation must not outlive the screen that owns it.
+        repo.localHotspot.stop()
+    }
+
     private suspend fun snapshotLoop() {
-        while (true) {
-            active.first { it }
-            val snapshot = runCatching { repo.snapshot() }.getOrNull()
-            if (snapshot != null) {
-                _state.update { it.copy(snapshot = snapshot, notes = repo.notes()) }
-                val iface = snapshot.hotspotInterface
-                val key = iface?.let { "${it.name}/${it.ipv4?.address}" }
-                if (key != scannedInterface) {
-                    scannedInterface = key
-                    if (iface == null) {
-                        _state.update { it.copy(clients = emptyList(), scanProgress = null) }
-                    } else {
-                        scanRequests.trySend(Unit)
-                    }
+        // collectLatest cancels the running iteration as soon as the app leaves the foreground.
+        active.collectLatest { isActive ->
+            if (!isActive) return@collectLatest
+            while (true) {
+                val snapshot = try {
+                    repo.snapshot()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
                 }
+                if (snapshot != null) _state.update { it.copy(snapshot = snapshot, notes = repo.notes()) }
+                withTimeoutOrNull(SNAPSHOT_INTERVAL_MS) { refreshRequests.receive() }
             }
-            withTimeoutOrNull(SNAPSHOT_INTERVAL_MS) { refreshRequests.receive() }
         }
     }
 
     private suspend fun clientLoop() {
+        val hotspotKey = _state
+            .map { s -> s.snapshot?.hotspotInterface?.let { "${it.name}/${it.ipv4?.address}/${it.ipv4?.prefixLength}" } }
+            .distinctUntilChanged()
+        combine(active, hotspotKey) { isActive, key -> isActive to key }
+            .distinctUntilChanged()
+            .collectLatest { (isActive, key) ->
+                if (key != scannedInterface) {
+                    // A different hotspot (or none): earlier clients belong to another subnet.
+                    scannedInterface = key
+                    _state.update { it.copy(clients = emptyList(), scanProgress = null, lastFullScanMs = null) }
+                }
+                if (!isActive || key == null) {
+                    _state.update { it.copy(scanProgress = null) }
+                    return@collectLatest
+                }
+                scanLoop()
+            }
+    }
+
+    /** Runs until cancelled by [clientLoop] when the app goes inactive or the interface changes. */
+    private suspend fun scanLoop() {
+        val key = scannedInterface
         var requested = true
         while (true) {
-            active.first { it }
             val current = _state.value
-            val hotspot = current.snapshot?.hotspotInterface
-            if (hotspot != null) {
-                val now = System.currentTimeMillis()
-                val full = requested || current.lastFullScanMs == null ||
-                    now - current.lastFullScanMs > FULL_SCAN_INTERVAL_MS
-                val clients = runCatching {
-                    repo.scanClients(hotspot, current.clients, full) { probed, total ->
-                        _state.update { it.copy(scanProgress = ScanProgress(probed, total)) }
-                    }
-                }.getOrElse { e ->
-                    _state.update { it.copy(message = "Scan failed: ${e.message}") }
-                    current.clients
+            val hotspot = current.snapshot?.hotspotInterface ?: return
+            val startedAt = System.currentTimeMillis()
+            val full = requested || current.lastFullScanMs == null ||
+                startedAt - current.lastFullScanMs > FULL_SCAN_INTERVAL_MS
+            val clients = try {
+                repo.scanClients(hotspot, current.clients, full) { probed, total ->
+                    if (scannedInterface == key) _state.update { it.copy(scanProgress = ScanProgress(probed, total)) }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = "Scan failed: ${e.message}", scanProgress = null) }
+                null
+            }
+            currentCoroutineContext().ensureActive()
+            if (clients != null) {
                 _state.update {
                     it.copy(
                         clients = clients,
                         scanProgress = null,
                         notes = repo.notes(),
-                        lastFullScanMs = if (full) System.currentTimeMillis() else it.lastFullScanMs,
+                        // Stamped at the start so slow sweeps on big subnets don't stretch the interval.
+                        lastFullScanMs = if (full) startedAt else it.lastFullScanMs,
                     )
                 }
             }

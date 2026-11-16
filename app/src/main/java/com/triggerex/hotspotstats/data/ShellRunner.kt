@@ -1,8 +1,10 @@
 package com.triggerex.hotspotstats.data
 
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -19,6 +21,10 @@ class ShellRunner {
     var rootGranted: Boolean = false
         private set
 
+    /** Whether the root shell has toybox `timeout`, so root commands can end themselves. */
+    @Volatile
+    private var rootHasTimeout: Boolean = false
+
     fun isSuPresent(): Boolean =
         SU_PATHS.any { File(it).exists() } ||
             System.getenv("PATH").orEmpty().split(':').any { File(it, "su").exists() }
@@ -27,6 +33,7 @@ class ShellRunner {
     suspend fun requestRoot(): Boolean {
         val result = run("id", root = true, timeoutMs = 20_000)
         rootGranted = result?.stdout?.contains("uid=0") == true
+        rootHasTimeout = rootGranted && run("timeout 1 true", root = true)?.ok == true
         return rootGranted
     }
 
@@ -38,29 +45,37 @@ class ShellRunner {
         withContext(Dispatchers.IO) {
             val process = try {
                 if (root) {
-                    ProcessBuilder("su", "-c", command).start()
+                    // With Magisk the command runs under magiskd and with setuid su it runs as
+                    // uid 0; the app can kill neither, so the root side must enforce its own limit.
+                    val seconds = ((timeoutMs + 999) / 1000).coerceAtLeast(1)
+                    val wrapped = if (rootHasTimeout) "timeout $seconds sh -c ${shellQuote(command)}" else command
+                    ProcessBuilder("su", "-c", wrapped).start()
                 } else {
                     ProcessBuilder("sh", "-c", command).start()
                 }
             } catch (_: Exception) {
                 return@withContext null
             }
-            // Blocking stream reads ignore coroutine cancellation, so the process itself is
-            // destroyed on timeout or cancellation; that closes the streams and frees the readers.
+            // Blocking stream reads ignore cancellation, and a root child may keep the pipes
+            // open after we destroy `su`. The readers therefore run detached (never awaited
+            // without a limit) and are abandoned if stuck.
+            val out = readerScope.async { runCatching { process.inputStream.bufferedReader().readText() }.getOrDefault("") }
+            val err = readerScope.async { runCatching { process.errorStream.bufferedReader().readText() }.getOrDefault("") }
             try {
-                coroutineScope {
-                    val out = async { process.inputStream.bufferedReader().readText() }
-                    val err = async { process.errorStream.bufferedReader().readText() }
-                    val finished = try {
-                        runInterruptible { process.waitFor(timeoutMs, TimeUnit.MILLISECONDS) }
-                    } finally {
-                        process.destroy()
-                    }
-                    val result = Result(if (finished) process.exitValue() else -1, out.await(), err.await())
-                    result.takeIf { finished }
+                val finished = try {
+                    runInterruptible { process.waitFor(timeoutMs, TimeUnit.MILLISECONDS) }
+                } finally {
+                    process.destroy()
                 }
-            } catch (e: java.io.IOException) {
-                null
+                if (!finished) return@withContext null
+                val stdout = withTimeoutOrNull(READ_GRACE_MS) { out.await() }
+                val stderr = withTimeoutOrNull(READ_GRACE_MS) { err.await() }.orEmpty()
+                stdout?.let { Result(process.exitValue(), it, stderr) }
+            } finally {
+                if (!out.isCompleted || !err.isCompleted) {
+                    runCatching { process.inputStream.close() }
+                    runCatching { process.errorStream.close() }
+                }
             }
         }
 
@@ -82,6 +97,11 @@ class ShellRunner {
     }
 
     companion object {
+        private const val READ_GRACE_MS = 1_000L
+        private val readerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        private fun shellQuote(s: String) = "'" + s.replace("'", "'\\''") + "'"
+
         private val SU_PATHS = listOf(
             "/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su",
             "/debug_ramdisk/su", "/data/adb/ksu/bin/su", "/data/adb/magisk/su",
