@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Card
@@ -28,6 +29,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -50,7 +52,12 @@ import com.triggerex.hotspotstats.ui.UiState
 import com.triggerex.hotspotstats.ui.latencyColor
 
 @Composable
-fun ClientsScreen(state: UiState, onRescan: () -> Unit, modifier: Modifier = Modifier) {
+fun ClientsScreen(
+    state: UiState,
+    onRescan: () -> Unit,
+    onCapture: (ConnectedClient) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val hotspot = state.snapshot?.hotspotInterface
     LazyColumn(
         modifier = modifier,
@@ -88,7 +95,9 @@ fun ClientsScreen(state: UiState, onRescan: () -> Unit, modifier: Modifier = Mod
         if (state.notes.isNotEmpty() || !state.rootEnabled) {
             item { LimitationsCard(state) }
         }
-        items(state.clients, key = { it.key }) { client -> ClientCard(client) }
+        items(state.clients, key = { it.key }) { client ->
+            ClientCard(client, canCapture = state.rootEnabled, onCapture = { onCapture(client) })
+        }
     }
 }
 
@@ -108,7 +117,7 @@ private fun LimitationsCard(state: UiState) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ClientCard(client: ConnectedClient) {
+private fun ClientCard(client: ConnectedClient, canCapture: Boolean, onCapture: () -> Unit) {
     var expanded by rememberSaveable(client.key) { mutableStateOf(false) }
     val station = client.station
     val signal = station?.signalDbm ?: station?.signalAvgDbm
@@ -199,6 +208,12 @@ private fun ClientCard(client: ConnectedClient) {
                         InfoRow("Last seen", Format.ago(client.lastSeenMs, now))
                         InfoRow("Found by", client.sources.joinToString(", ") { it.label })
                     }
+                }
+                Spacer(Modifier.padding(top = 4.dp))
+                OutlinedButton(onClick = onCapture, enabled = canCapture) {
+                    Icon(Icons.Filled.FiberManualRecord, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (canCapture) "Capture this device's packets" else "Packet capture needs root")
                 }
             }
         }

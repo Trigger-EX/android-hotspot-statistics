@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Refresh
@@ -40,6 +41,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -49,6 +51,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
+import com.triggerex.hotspotstats.ui.screens.CaptureScreen
 import com.triggerex.hotspotstats.ui.screens.ClientsScreen
 import com.triggerex.hotspotstats.ui.screens.InterfacesScreen
 import com.triggerex.hotspotstats.ui.screens.OverviewScreen
@@ -73,6 +77,7 @@ class MainActivity : ComponentActivity() {
 private enum class Tab(val label: String, val icon: ImageVector) {
     OVERVIEW("Overview", Icons.Filled.Dashboard),
     CLIENTS("Clients", Icons.Filled.Devices),
+    CAPTURE("Capture", Icons.Filled.FiberManualRecord),
     INTERFACES("Interfaces", Icons.Filled.Hub),
     UPSTREAM("Upstream", Icons.Filled.Language),
 }
@@ -82,8 +87,11 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 private fun App(viewModel: HotspotViewModel) {
     val context = LocalContext.current
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val capture by viewModel.capture.collectAsStateWithLifecycle()
+    val captureFiles by viewModel.captureFiles.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
     var hasPhonePermission by remember { mutableStateOf(context.has(Manifest.permission.READ_PHONE_STATE)) }
 
     LifecycleStartEffect(Unit) {
@@ -104,6 +112,8 @@ private fun App(viewModel: HotspotViewModel) {
     ) { results ->
         if (results.values.all { it }) viewModel.startLocalHotspot()
     }
+    // The capture notification is optional; capture runs either way.
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     val phonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         hasPhonePermission = granted
         viewModel.refresh()
@@ -129,8 +139,23 @@ private fun App(viewModel: HotspotViewModel) {
                     NavigationBarItem(
                         selected = tab == index,
                         onClick = { tab = index },
-                        icon = { Icon(t.icon, contentDescription = null) },
-                        label = { Text(if (t == Tab.CLIENTS) "${t.label} (${state.clients.size})" else t.label) },
+                        icon = {
+                            Icon(
+                                t.icon,
+                                contentDescription = null,
+                                tint = if (t == Tab.CAPTURE && capture?.running == true) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    androidx.compose.material3.LocalContentColor.current
+                                },
+                            )
+                        },
+                        label = {
+                            Text(
+                                if (t == Tab.CLIENTS) "${t.label} (${state.clients.size})" else t.label,
+                                maxLines = 1,
+                            )
+                        },
                     )
                 }
             }
@@ -161,7 +186,35 @@ private fun App(viewModel: HotspotViewModel) {
                 onOpenHotspotSettings = { context.openHotspotSettings() },
                 modifier = modifier,
             )
-            Tab.CLIENTS -> ClientsScreen(state, onRescan = viewModel::rescan, modifier = modifier)
+            Tab.CLIENTS -> ClientsScreen(
+                state,
+                onRescan = viewModel::rescan,
+                onCapture = { client ->
+                    viewModel.selectOnlyForCapture(client.key)
+                    tab = Tab.CAPTURE.ordinal
+                },
+                modifier = modifier,
+            )
+            Tab.CAPTURE -> CaptureScreen(
+                state = state,
+                capture = capture,
+                files = captureFiles,
+                onToggleHost = viewModel::toggleCaptureHost,
+                onClearSelection = viewModel::clearCaptureSelection,
+                onStart = { options ->
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        !context.has(Manifest.permission.POST_NOTIFICATIONS)
+                    ) {
+                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    viewModel.startCapture(options)?.let { error -> scope.launch { snackbar.showSnackbar(error) } }
+                },
+                onStop = viewModel::stopCapture,
+                onShare = { file -> context.startActivity(viewModel.shareCapture(file)) },
+                onDelete = viewModel::deleteCapture,
+                onOpenOverview = { tab = Tab.OVERVIEW.ordinal },
+                modifier = modifier,
+            )
             Tab.INTERFACES -> InterfacesScreen(state, modifier = modifier)
             Tab.UPSTREAM -> UpstreamScreen(
                 state = state,

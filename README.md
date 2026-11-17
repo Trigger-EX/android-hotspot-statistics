@@ -11,6 +11,7 @@ connection being shared.
 |---|---|
 | **Overview** | Hotspot state, interface, hotspot IP / subnet / IPv6, connected-client count; configuration (SSID, password, security, band, channel); live traffic to and from clients; hotspot data usage today and for the last 30 days; root mode; local-only hotspot |
 | **Clients** | Every device found on the hotspot: hostname, device type, IP, MAC (and whether it is a private random MAC), ping latency, open ports, ARP state, first / last seen. With root + `iw`: Wi-Fi signal (dBm and bars), TX/RX link rate, bytes and packets, retries, connected time |
+| **Capture** (root) | Capture packets from selected devices (or all hotspot traffic) to a `.pcap` file: live packet list with protocols, ports, TCP flags and DNS names, counters and kernel drops; time / size limits and a headers-only mode; keeps running in the background; share files to Wireshark or any pcap tool |
 | **Interfaces** | All network interfaces, classified (Wi-Fi hotspot, USB / Bluetooth tethering, cellular, VPN…), with addresses, MAC, MTU, live rates and counters |
 | **Upstream** | The network the hotspot shares: transport, validation, metered, bandwidth estimate, gateway, DNS, private DNS; Wi-Fi RSSI / link speed / frequency, or cellular operator, generation (4G / 5G NSA / 5G SA), RSRP / RSRQ / SINR and level; device traffic since boot |
 
@@ -30,6 +31,7 @@ always says where a value came from or why it is missing.
 | Client signal strength / link rate | **Not available** — Android has no API for it | `iw dev <if> station dump`, if the `iw` binary is installed |
 | Interface traffic counters | `/sys/class/net/<if>/statistics` where readable | always |
 | Hotspot data usage | `NetworkStatsManager` tethering bucket, after granting **Usage access** | same |
+| Packet capture | **Not possible** — tethered traffic is forwarded in the kernel and bypasses VPN-based capture | Bundled `hscapture` helper on the hotspot interface |
 | Upstream signal | `NetworkCapabilities`, `WifiInfo`, `TelephonyManager.getSignalStrength()` | same |
 
 Consequences worth knowing:
@@ -41,6 +43,24 @@ Consequences worth knowing:
 - Root mode works with Magisk, KernelSU and similar. Per-client signal additionally needs
   an `iw` binary on the device (not part of stock Android; Magisk modules provide it).
 
+## Packet capture
+
+On the **Capture** tab, tick the devices to capture (or none for all hotspot traffic), pick a
+time limit and maximum file size, and tap **Capture**. A client card's
+**Capture this device's packets** button preselects that device. The capture keeps running in
+the background with a notification that has a **Stop** button. Saved files are standard
+libpcap (`.pcap`); use **Share** to send them to Wireshark, a file manager or cloud storage.
+
+How it works: the app ships a small C helper (`app/src/main/c/hscapture.c`, no dependencies,
+built for all four Android ABIs with the NDK). It runs as root, opens a packet socket on the
+hotspot interface, and keeps only frames whose MAC or IPv4 address (including ARP) matches a
+selected device. It streams pcap to the app, which writes the file itself, and reports
+counters and packet summaries alongside. It stops on request, at its limits, or if the app
+goes away, so a root process is never left running. Devices without a known MAC are matched by
+IPv4 only, which leaves out their IPv6 traffic.
+
+Only capture devices you own or are authorised to monitor.
+
 ## Permissions
 
 | Permission | Why | Required? |
@@ -49,12 +69,15 @@ Consequences worth knowing:
 | `CHANGE_WIFI_STATE` + `NEARBY_WIFI_DEVICES` (13+) or location (≤ 12) | Starting the local-only hotspot | Only for that feature, asked when used |
 | `READ_PHONE_STATE` | Exact cellular network type | Optional, asked from the Upstream tab |
 | Usage access (special setting) | Hotspot data usage | Optional, from the Overview tab |
+| `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `POST_NOTIFICATIONS` | Keeping a packet capture running in the background, with a notification | Notifications asked when a capture starts; capture works without them |
 
-The app collects nothing and sends nothing off the device; all probes stay on the hotspot subnet.
+The app collects nothing and sends nothing off the device; all probes stay on the hotspot
+subnet, and capture files stay in app storage unless you share them.
 
 ## Building
 
-Requirements: JDK 17+ and the Android SDK (platform 35, build-tools 35).
+Requirements: JDK 17+ and the Android SDK (platform 35, build-tools 35, NDK 27.2.12479018 for
+the capture helper; Gradle downloads the NDK if it is missing and the SDK licences are accepted).
 
 ```bash
 echo "sdk.dir=/path/to/android-sdk" > local.properties
@@ -77,6 +100,16 @@ mDNS packets, plus the client merge logic) and lint:
 ./gradlew testDebugUnitTest lintDebug
 ```
 
+The capture helper has its own test suite, which runs it against real loopback traffic (Linux, root):
+
+```bash
+gcc -O2 -o /tmp/hscapture app/src/main/c/hscapture.c
+```
+
+```bash
+sudo python3 app/src/test/c/test_hscapture.py /tmp/hscapture
+```
+
 ## Project layout
 
 ```
@@ -93,6 +126,11 @@ app/src/main/java/com/triggerex/hotspotstats/
     LocalHotspotController.kt
     ShellRunner.kt          shell / su with timeouts
     HotspotRepository.kt    composes the above
+  capture/
+    CaptureProtocol.kt      helper command building / validation, status parsing (unit tested)
+    CaptureManager.kt       runs one capture, writes the pcap, saved captures
+    CaptureService.kt       foreground service + notification
+app/src/main/c/hscapture.c  root packet-capture helper (NDK)
   ui/
     HotspotViewModel.kt     refresh loops (pause when the app is in the background)
     MainActivity.kt, screens/, theme/

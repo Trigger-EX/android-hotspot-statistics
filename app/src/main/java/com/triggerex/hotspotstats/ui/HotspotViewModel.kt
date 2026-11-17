@@ -4,6 +4,12 @@ import android.app.Application
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.triggerex.hotspotstats.capture.CaptureFile
+import com.triggerex.hotspotstats.capture.CaptureHost
+import com.triggerex.hotspotstats.capture.CaptureManager
+import com.triggerex.hotspotstats.capture.CaptureRequest
+import com.triggerex.hotspotstats.capture.CaptureService
+import com.triggerex.hotspotstats.capture.CaptureState
 import com.triggerex.hotspotstats.data.ConnectedClient
 import com.triggerex.hotspotstats.data.HotspotRepository
 import com.triggerex.hotspotstats.data.HotspotSnapshot
@@ -34,7 +40,12 @@ data class UiState(
     val rootRequesting: Boolean = false,
     val message: String? = null,
     val localHotspot: LocalHotspotController.State = LocalHotspotController.State.Off,
+    /** Client keys selected for packet capture. */
+    val captureSelection: Set<String> = emptySet(),
 )
+
+/** Capture limits chosen on the Capture tab. */
+data class CaptureOptions(val durationSec: Int, val maxBytes: Long, val headersOnly: Boolean)
 
 class HotspotViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -50,7 +61,11 @@ class HotspotViewModel(app: Application) : AndroidViewModel(app) {
     private val refreshRequests = Channel<Unit>(Channel.CONFLATED)
     private var scannedInterface: String? = null
 
+    val capture: StateFlow<CaptureState?> = CaptureManager.state
+    val captureFiles: StateFlow<List<CaptureFile>> = CaptureManager.files
+
     init {
+        CaptureManager.init(app)
         if (prefs.getBoolean(KEY_ROOT, false) && repo.isSuPresent()) setRootEnabled(true)
 
         viewModelScope.launch { snapshotLoop() }
@@ -107,6 +122,44 @@ class HotspotViewModel(app: Application) : AndroidViewModel(app) {
             scanRequests.trySend(Unit)
         }
     }
+
+    fun toggleCaptureHost(key: String) = _state.update {
+        val sel = it.captureSelection
+        it.copy(captureSelection = if (key in sel) sel - key else sel + key)
+    }
+
+    fun selectOnlyForCapture(key: String) = _state.update { it.copy(captureSelection = setOf(key)) }
+
+    fun clearCaptureSelection() = _state.update { it.copy(captureSelection = emptySet()) }
+
+    /** Starts a capture of the selected clients (all traffic if none). Returns an error or null. */
+    fun startCapture(options: CaptureOptions): String? {
+        val s = _state.value
+        if (!s.rootEnabled) return "Packet capture needs root. Turn on root mode on the Overview tab."
+        val iface = s.snapshot?.hotspotInterface ?: return "No active hotspot interface."
+        val hosts = s.clients
+            .filter { it.key in s.captureSelection }
+            .map { CaptureHost(it.ip, it.mac, it.hostname ?: it.ip ?: it.mac ?: "host") }
+        if (s.captureSelection.isNotEmpty() && hosts.isEmpty()) {
+            return "The selected devices are no longer connected."
+        }
+        val request = CaptureRequest(
+            iface = iface.name,
+            hosts = hosts,
+            durationSec = options.durationSec,
+            maxBytes = options.maxBytes,
+            snaplen = if (options.headersOnly) HEADERS_SNAPLEN else 65535,
+        )
+        val error = CaptureManager.start(request)
+        if (error == null) CaptureService.startTracking(getApplication())
+        return error
+    }
+
+    fun stopCapture() = CaptureManager.stop()
+
+    fun deleteCapture(file: CaptureFile) = CaptureManager.delete(file.file)
+
+    fun shareCapture(file: CaptureFile) = CaptureManager.shareIntent(file.file)
 
     fun startLocalHotspot() = repo.localHotspot.start()
     fun stopLocalHotspot() = repo.localHotspot.stop()
@@ -191,6 +244,8 @@ class HotspotViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private companion object {
+        /** Enough for Ethernet + IPv6 + TCP headers with options. */
+        const val HEADERS_SNAPLEN = 128
         const val KEY_ROOT = "root_enabled"
         const val SNAPSHOT_INTERVAL_MS = 2_000L
         const val QUICK_SCAN_INTERVAL_MS = 8_000L

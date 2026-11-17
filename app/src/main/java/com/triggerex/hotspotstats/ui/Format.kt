@@ -56,6 +56,8 @@ object Format {
 
     fun time(timestampMs: Long): String = DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(timestampMs))
 
+    fun clock(epochMs: Long): String = java.text.SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date(epochMs))
+
     fun ms(value: Double?): String = when {
         value == null -> "—"
         value < 10 -> String.format(Locale.US, "%.1f ms", value)

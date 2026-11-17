@@ -60,3 +60,42 @@ minSdk 26, compile/targetSdk 35. AGP 8.7.3, Gradle 8.14.3 wrapper.
 ## Verification
 `./gradlew testDebugUnitTest assembleDebug lintDebug` must pass. No device in the container,
 so on-device behaviour is checked only by reasoning; README states this.
+
+---
+
+# Plan: packet capture for selected hosts
+
+## Constraint
+Hotspot traffic is forwarded inside the kernel. Without root, no app can see other
+devices' packets (VpnService only sees the phone's own traffic; tethering bypasses it).
+So capture requires root. Stock Android has no `tcpdump`, so the app ships its own helper.
+
+## Design
+- **Native helper `hscapture`** (C, no dependencies), built with the NDK for
+  arm64-v8a / armeabi-v7a / x86_64 / x86 and packaged as `libhscapture.so` in jniLibs
+  (legacy packaging so it is extracted to `nativeLibraryDir` and executable). Run as root via `su`.
+  - `AF_PACKET` raw socket bound to the hotspot interface, both directions.
+  - Userspace filter: match Ethernet src/dst MAC or IPv4 src/dst (incl. ARP sender/target)
+    against the selected hosts; no filter = all hotspot traffic.
+  - pcap (libpcap format, microsecond) written to **stdout**, so the file is created by
+    the app itself (avoids root-owned / SELinux-mislabelled files in app storage).
+  - Status on **stderr**, one line each: `S` stats every second (packets, bytes, kernel drops),
+    `P` rate-limited per-packet summaries (proto, addresses, ports, TCP flags, DNS name), `E` errors, `X` end.
+  - Stops on `q` / EOF on stdin, on EPIPE, or on `-d` duration / `-c` count limits.
+    poll() on socket + stdin, so no busy loop. Never needs to be killed by the app.
+- **`CaptureSession`** (Kotlin): starts the helper through `su`, pumps stdout to
+  `files/captures/<name>.pcap` with a size cap, parses stderr into a `StateFlow`.
+- **`CaptureManager`** (process singleton): one active session, list of saved captures,
+  delete, share via `FileProvider`.
+- **`CaptureService`**: foreground service so capture continues with the app in the
+  background; notification with live counters and a Stop action.
+- **UI**: new **Capture** tab — pick hosts (checkboxes over current clients, or all),
+  limits (duration, size, headers-only snaplen), Start/Stop, live stats and packet list,
+  saved captures with Share / Delete. Client cards get "Capture this device".
+- Input validation: interface, IPs and MACs checked by regex before building the command.
+
+## Verification
+- Compile the helper with host gcc and run it as root on `lo` in this container:
+  ping filtered vs unfiltered traffic, check the pcap with Python and the stderr protocol.
+- JVM tests for the stderr line parser and argument building / validation.
+- `testDebugUnitTest assembleDebug lintDebug`; confirm the APK contains `libhscapture.so` for every ABI.
