@@ -21,6 +21,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 data class CapturedPacket(val epochMs: Long, val length: Int, val summary: String)
@@ -71,8 +72,16 @@ object CaptureManager {
     fun init(context: Context) {
         if (::app.isInitialized) return
         app = context.applicationContext
+        // A marker left behind means the process died mid-capture: repair that file.
+        val marker = activeMarker()
+        if (marker.exists()) {
+            runCatching { File(capturesDir(), marker.readText().trim()).takeIf { it.exists() }?.let(PcapFiles::truncateToLastRecord) }
+            marker.delete()
+        }
         refreshFiles()
     }
+
+    private fun activeMarker() = File(capturesDir(), ".active")
 
     val isRunning: Boolean get() = _state.value?.running == true
 
@@ -93,34 +102,41 @@ object CaptureManager {
         } catch (e: IllegalArgumentException) {
             return e.message
         }
-        val file = File(capturesDir(), fileName(request))
+        val file = newCaptureFile(request) ?: return "Could not create the capture file."
         val proc = try {
             ProcessBuilder("su", "-c", command).start()
         } catch (e: IOException) {
+            file.delete()
             return "Could not run su: ${e.message}"
         }
         process = proc
+        runCatching { activeMarker().writeText(file.name) }
         val written = AtomicLong(0)
+        val started = AtomicBoolean(false)
         _state.value = CaptureState(request, file, System.currentTimeMillis(), running = true)
 
         val pump = scope.launch { pumpOutput(proc, file, written) }
-        val reader = scope.launch { readStatus(proc, written) }
+        val reader = scope.launch { readStatus(proc, file, written, started) }
         scope.launch {
             val code = runInterruptible { proc.waitFor() }
             // Give the readers a moment to drain what the helper wrote before exiting.
             withTimeoutOrNull(3_000) { pump.join(); reader.join() }
-            process = null
-            _state.update { s ->
-                s?.copy(
+            if (process === proc) process = null
+            // The pipe carries bytes, not packets: an abrupt end can leave half a record.
+            runCatching { PcapFiles.truncateToLastRecord(file) }
+            activeMarker().delete()
+            updateIfCurrent(file) { s ->
+                s.copy(
                     running = false,
                     stopping = false,
-                    fileBytes = written.get(),
+                    fileBytes = file.length(),
                     endReason = s.endReason ?: if (s.error == null) "Helper exited (code $code)" else null,
                     error = s.error ?: if (!s.capturing && code != 0) "Root access was denied or the helper could not start (code $code)." else null,
                 )
             }
-            // A capture that never started leaves only a header; don't keep it.
-            if (_state.value?.capturing != true) file.delete()
+            // A capture that never started holds only a header; don't keep it. Decided from this
+            // capture's own flag, so a newer capture's state can't affect it.
+            if (!started.get()) file.delete()
             refreshFiles()
         }
         return null
@@ -142,6 +158,11 @@ object CaptureManager {
         }
     }
 
+    /** Applies [block] only while [file]'s capture is still the one in [state]. */
+    private inline fun updateIfCurrent(file: File, crossinline block: (CaptureState) -> CaptureState) {
+        _state.update { s -> if (s == null || s.file != file) s else block(s) }
+    }
+
     private fun pumpOutput(proc: Process, file: File, written: AtomicLong) {
         try {
             FileOutputStream(file).use { out ->
@@ -155,11 +176,14 @@ object CaptureManager {
                 }
             }
         } catch (e: IOException) {
-            _state.update { it?.copy(error = it.error ?: "Writing the capture failed: ${e.message}") }
+            updateIfCurrent(file) { it.copy(error = it.error ?: "Writing the capture failed: ${e.message}") }
+            // Stop reading so the helper gets EPIPE and exits, instead of blocking forever on a
+            // full pipe (where it could no longer see 'q' or its time limit).
+            runCatching { proc.inputStream.close() }
         }
     }
 
-    private fun readStatus(proc: Process, written: AtomicLong) {
+    private fun readStatus(proc: Process, file: File, written: AtomicLong, started: AtomicBoolean) {
         val recent = ArrayDeque<CapturedPacket>()
         var lastPublish = 0L
         val unknown = StringBuilder()
@@ -178,9 +202,9 @@ object CaptureManager {
                 val now = System.currentTimeMillis()
                 if (event is CaptureEvent.Packet && now - lastPublish < PUBLISH_INTERVAL_MS) return@forEachLine
                 lastPublish = now
+                if (event is CaptureEvent.Started) started.set(true)
                 val snapshot = recent.toList()
-                _state.update { s ->
-                    s ?: return@update null
+                updateIfCurrent(file) { s ->
                     when (event) {
                         is CaptureEvent.Started -> s.copy(capturing = true)
                         is CaptureEvent.Stats -> s.copy(
@@ -200,7 +224,7 @@ object CaptureManager {
             // Stream closed when the process ended.
         }
         if (unknown.isNotBlank()) {
-            _state.update { s -> s?.takeIf { !it.capturing && it.error == null }?.copy(error = unknown.toString().trim()) ?: s }
+            updateIfCurrent(file) { s -> if (!s.capturing && s.error == null) s.copy(error = unknown.toString().trim()) else s }
         }
     }
 
@@ -229,8 +253,18 @@ object CaptureManager {
         return Intent.createChooser(send, "Share capture").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
 
+    /** Creates a new, empty file whose name no earlier capture uses. */
+    private fun newCaptureFile(request: CaptureRequest): File? {
+        val base = fileName(request).removeSuffix(".pcap")
+        for (i in 0 until 100) {
+            val f = File(capturesDir(), if (i == 0) "$base.pcap" else "${base}_$i.pcap")
+            if (runCatching { f.createNewFile() }.getOrDefault(false)) return f
+        }
+        return null
+    }
+
     private fun fileName(request: CaptureRequest): String {
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val label = when (request.hosts.size) {
             0 -> "all"
             1 -> request.hosts[0].label.replace(Regex("[^A-Za-z0-9-]+"), "-").trim('-').take(24).ifEmpty { "host" }

@@ -297,6 +297,13 @@ private fun LiveCaptureCard(capture: CaptureState, onStop: () -> Unit) {
             valueColor = if (capture.kernelDrops > 0) Quality.fair else null,
         )
         capture.endReason?.let { InfoRow("Ended", it) }
+        if (capture.running && capture.capturing && capture.elapsedMs > 15_000 && capture.packets < 20) {
+            Note(
+                "Seeing few packets? Some phones forward hotspot traffic in hardware, which hides " +
+                    "established connections from capture. Turn off \"Tethering hardware acceleration\" " +
+                    "in Developer options, then restart the hotspot and the capture.",
+            )
+        }
         if (capture.running) {
             Button(
                 onClick = onStop,

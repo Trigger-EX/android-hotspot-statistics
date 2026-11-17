@@ -11,8 +11,8 @@
  *   E <message>                                   error
  *   X <reason> <packets> <bytes> <drops>          capture ended
  *
- * It stops when stdin delivers 'q' or EOF, when stdout breaks, or on -d / -c limits, so the
- * caller never has to kill a root process.
+ * It stops when stdin delivers 'q' or EOF, when stdout breaks, when the interface goes down,
+ * or on -d / -c / -C limits, so the caller never has to kill a root process.
  *
  * Usage: hscapture -i IFACE [-a IPV4]... [-m MAC]... [-s SNAPLEN] [-d SECONDS]
  *                  [-c COUNT] [-C MAX_FILE_BYTES] [-r SUMMARIES_PER_SEC] [-n]
@@ -277,7 +277,9 @@ int main(int argc, char **argv) {
         if (s >= 0) close(s);
     }
 
-    int sock = socket(AF_PACKET, sock_type, htons(ETH_P_ALL));
+    /* Protocol 0: receive nothing until bind() picks the interface, otherwise frames from
+     * every interface (raw-IP cellular, loopback) would queue up first. */
+    int sock = socket(AF_PACKET, sock_type, 0);
     if (sock < 0) {
         fprintf(stderr, "E socket: %s (root required)\n", strerror(errno));
         return 4;
@@ -314,7 +316,8 @@ int main(int argc, char **argv) {
 
     static uint8_t buf[BUF_SIZE];
     long long packets = 0, bytes = 0, drops = 0, seen = 0, file_bytes = (long long) sizeof hdr;
-    int64_t start = now_ms(CLOCK_MONOTONIC), next_stat = start + 1000, window = start;
+    /* BOOTTIME keeps counting through deep sleep, so time limits are wall-clock accurate. */
+    int64_t start = now_ms(CLOCK_BOOTTIME), next_stat = start + 1000, window = start;
     int summaries = 0, suppressed = 0;
     const char *reason = "stopped";
 
@@ -327,7 +330,7 @@ int main(int argc, char **argv) {
             reason = "poll-error";
             break;
         }
-        int64_t now = now_ms(CLOCK_MONOTONIC);
+        int64_t now = now_ms(CLOCK_BOOTTIME);
 
         if (nfds == 2 && pfd[1].revents) {
             char cmd[64];
@@ -338,12 +341,30 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (r > 0 && (pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            /* Interface went down or was removed (hotspot turned off): the socket now only
+             * reports an error, which poll() would return forever. */
+            int soerr = 0;
+            socklen_t el = sizeof soerr;
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &soerr, &el);
+            fprintf(stderr, "E capture interface stopped: %s\n", soerr ? strerror(soerr) : "socket error");
+            reason = "interface-down";
+            break;
+        }
+
         if (r > 0 && (pfd[0].revents & POLLIN)) {
             for (int burst = 0; burst < 512; burst++) {
                 struct sockaddr_ll from;
                 socklen_t fromlen = sizeof from;
                 ssize_t n = recvfrom(sock, buf, sizeof buf, MSG_DONTWAIT | MSG_TRUNC, (struct sockaddr *) &from, &fromlen);
-                if (n < 0) break;
+                if (n < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        fprintf(stderr, "E capture interface stopped: %s\n", strerror(errno));
+                        reason = "interface-down";
+                        g_stop = 1;
+                    }
+                    break;
+                }
                 /* Loopback shows every packet twice (out and in); keep one, as tcpdump does. */
                 if (is_loopback && from.sll_pkttype == PACKET_OUTGOING) continue;
                 seen++;

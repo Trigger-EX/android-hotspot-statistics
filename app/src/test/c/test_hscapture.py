@@ -140,5 +140,26 @@ check(r.returncode == 2 and b"E bad" in r.stderr, "rejects bad IP")
 r = subprocess.run([BIN, "-i", "nope0"], capture_output=True)
 check(r.returncode == 3 and b"E no such interface" in r.stderr, "rejects unknown interface")
 
+# 8. Interface removed mid-capture (hotspot turned off) ends the capture instead of spinning.
+#    Needs pyroute2 and veth support; skipped otherwise.
+try:
+    from pyroute2 import IPRoute
+    ipr = IPRoute()
+    ipr.link("add", ifname="hstest0", kind="veth", peer="hstest1")
+except Exception as e:  # noqa: BLE001
+    print(f"SKIP interface-removal test ({e})")
+else:
+    idx = ipr.link_lookup(ifname="hstest0")[0]
+    ipr.link("set", index=idx, state="up")
+    p = subprocess.Popen([BIN, "-i", "hstest0"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(0.8)
+    ipr.link("del", index=idx)
+    try:
+        p.wait(timeout=5)  # stdin stays open: only the interface going away can end it
+        check(b"X interface-down" in p.stderr.read(), "interface removal ends capture")
+    except subprocess.TimeoutExpired:
+        p.kill()
+        check(False, "interface removal ends capture (helper hung)")
+
 print("\nFAILURES:", failures if failures else "none")
 sys.exit(1 if failures else 0)

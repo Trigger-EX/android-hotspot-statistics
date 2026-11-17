@@ -59,6 +59,11 @@ counters and packet summaries alongside. It stops on request, at its limits, or 
 goes away, so a root process is never left running. Devices without a known MAC are matched by
 IPv4 only, which leaves out their IPv6 traffic.
 
+On phones that forward tethered traffic in hardware (common on Qualcomm devices), established
+connections bypass the capture point and only their first packets are recorded. Turning off
+**Tethering hardware acceleration** in Developer options, then restarting the hotspot, fixes this;
+the app shows this hint when a capture sees almost nothing.
+
 Only capture devices you own or are authorised to monitor.
 
 ## Permissions

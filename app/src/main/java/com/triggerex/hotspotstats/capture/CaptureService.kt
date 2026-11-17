@@ -32,6 +32,10 @@ class CaptureService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var observing = false
 
+    /** Latest start; stopSelf(id) then cannot cancel a start that arrives meanwhile. */
+    @Volatile
+    private var lastStartId = 0
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     @OptIn(FlowPreview::class)
@@ -39,8 +43,11 @@ class CaptureService : Service() {
         CaptureManager.init(this)
         if (intent?.action == ACTION_STOP) {
             CaptureManager.stop()
+            // A Stop delivered to a fresh instance (no capture running) must not leave it started.
+            if (!CaptureManager.isRunning) stopSelf(startId)
             return START_NOT_STICKY
         }
+        lastStartId = startId
         createChannel()
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
@@ -54,7 +61,7 @@ class CaptureService : Service() {
                 CaptureManager.state.sample(1_000).collect { state ->
                     if (state == null || !state.running) {
                         ServiceCompat.stopForeground(this@CaptureService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        stopSelf(lastStartId)
                     } else {
                         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(state))
                     }
